@@ -41,7 +41,7 @@
 
 ## 📢 News
 
-<!-- > **[2026-01]** 🎉 InfiniDepth paper released on arXiv! Code coming soon! -->
+> **[2026-02]** 🎉 InfiniDepth has been accepted to CVPR 2026! Code coming soon!
 
 
 ## ✨ Highlights
