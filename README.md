@@ -67,7 +67,7 @@ If you want to test InfiniDepth before running local CLI inference, start with t
 
 This repo also includes a Gradio Space entrypoint at `app.py`:
 
-- input: RGB image (required), depth map (optional)
+- Input: RGB image (required), depth map (optional)
 - Task Switch: `Depth` / `3DGS`
 - Model Switch: `InfiniDepth` / `InfiniDepth_DepthSensor`
 
@@ -287,7 +287,7 @@ bash example_scripts/infer_gs/waymo_infinidepth_depthsensor_gs.sh
 </details>
 
 <details>
-<summary><strong>4.Common Argument Conventions</strong></summary>
+<summary><strong>4. Common Argument Conventions</strong></summary>
 
 | Argument | Used in | Description |
 | --- | --- | --- |
