@@ -43,11 +43,6 @@ class SequenceDepthInferenceArgs:
     depth_model_path: str = "checkpoints/depth/infinidepth.ckpt"
     moge2_pretrained: str = "checkpoints/moge-2-vitl-normal/model.pt"
 
-    fx_org: Optional[float] = None
-    fy_org: Optional[float] = None
-    cx_org: Optional[float] = None
-    cy_org: Optional[float] = None
-
     input_size: tuple[int, int] = (768, 1024)
     output_size: tuple[int, int] = (768, 1024)
     output_resolution_mode: Literal["upsample", "original", "specific"] = "upsample"
@@ -291,17 +286,13 @@ def _run_da3_inference(model, frame_paths: list[str], args: SequenceDepthInferen
 def _build_frame_args(args: SequenceDepthInferenceArgs) -> DepthInferenceArgs:
     return DepthInferenceArgs(
         input_image_path=args.input_path,
-        input_depth_path=args.input_depth_path,
+        input_depth_path=args.input_depth_path if args.model_type == "InfiniDepth_DepthSensor" else None,
         depth_output_dir=None,
         pcd_output_dir=None,
         save_pcd=args.save_frame_pcd,
         model_type=args.model_type,
         depth_model_path=args.depth_model_path,
         moge2_pretrained=args.moge2_pretrained,
-        fx_org=args.fx_org,
-        fy_org=args.fy_org,
-        cx_org=args.cx_org,
-        cy_org=args.cy_org,
         input_size=args.input_size,
         output_size=args.output_size,
         output_resolution_mode=args.output_resolution_mode,
@@ -311,14 +302,55 @@ def _build_frame_args(args: SequenceDepthInferenceArgs) -> DepthInferenceArgs:
     )
 
 
-def _resolve_frame_intrinsics(args: SequenceDepthInferenceArgs, da3_intrinsics_org: np.ndarray) -> tuple[float, float, float, float, str]:
-    user_flags = [value is not None for value in (args.fx_org, args.fy_org, args.cx_org, args.cy_org)]
-    source = "user" if all(user_flags) else "user+da3" if any(user_flags) else "da3"
-    fx_org = float(args.fx_org) if args.fx_org is not None else float(da3_intrinsics_org[0, 0])
-    fy_org = float(args.fy_org) if args.fy_org is not None else float(da3_intrinsics_org[1, 1])
-    cx_org = float(args.cx_org) if args.cx_org is not None else float(da3_intrinsics_org[0, 2])
-    cy_org = float(args.cy_org) if args.cy_org is not None else float(da3_intrinsics_org[1, 2])
-    return fx_org, fy_org, cx_org, cy_org, source
+def _resolve_da3_intrinsics_original(
+    da3_outputs: dict[str, np.ndarray | Optional[np.ndarray] | Optional[str] | int],
+    frame_index: int,
+    org_h: int,
+    org_w: int,
+) -> np.ndarray:
+    return scale_intrinsics_matrix_np(
+        da3_outputs["intrinsics"][frame_index],
+        src_h=int(da3_outputs["processed_h"]),
+        src_w=int(da3_outputs["processed_w"]),
+        dst_h=org_h,
+        dst_w=org_w,
+    )
+
+
+def _build_da3_output_intrinsics(
+    da3_intrinsics_org: np.ndarray,
+    org_h: int,
+    org_w: int,
+    output_h: int,
+    output_w: int,
+) -> np.ndarray:
+    return scale_intrinsics_matrix_np(
+        da3_intrinsics_org,
+        src_h=org_h,
+        src_w=org_w,
+        dst_h=output_h,
+        dst_w=output_w,
+    )
+
+
+def _build_da3_ransac_override(
+    frame_da3_depth: np.ndarray,
+    frame_conf: Optional[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    depth = np.asarray(frame_da3_depth, dtype=np.float32)
+    mask = np.isfinite(depth) & (depth > 1e-6)
+    if frame_conf is not None:
+        conf = np.asarray(frame_conf, dtype=np.float32)
+        mask &= np.isfinite(conf) & (conf > 0.0)
+    return depth, mask.astype(np.float32)
+
+
+def _should_use_da3_ransac_reference(model_type: str) -> bool:
+    return model_type == "InfiniDepth"
+
+
+def _should_apply_da3_post_scale_align(args: SequenceDepthInferenceArgs) -> bool:
+    return args.model_type == "InfiniDepth_DepthSensor" and args.align_to_da3_depth
 
 
 def _write_json(path: str, payload: dict) -> None:
@@ -345,8 +377,9 @@ def main(args: SequenceDepthInferenceArgs) -> None:
     output_paths = resolve_sequence_output_paths(str(input_path), args.output_root)
 
     frame_paths, source_fps, source_type = _prepare_rgb_inputs(input_path, input_mode, output_paths)
+    use_input_depth = args.model_type == "InfiniDepth_DepthSensor"
     depth_frame_paths, depth_source_fps, depth_source_type = _prepare_depth_inputs(
-        args.input_depth_path,
+        args.input_depth_path if use_input_depth else None,
         input_mode,
         output_paths,
         expected_count=len(frame_paths),
@@ -374,22 +407,29 @@ def main(args: SequenceDepthInferenceArgs) -> None:
 
     merged_frame_pcds = []
     frame_meta_paths: list[str] = []
+    da3_ransac_reference_enabled = _should_use_da3_ransac_reference(args.model_type)
+    da3_post_scale_align_enabled = _should_apply_da3_post_scale_align(args)
 
     for frame_index, frame_path in enumerate(frame_paths):
         print(f"Processing frame {frame_index + 1}/{len(frame_paths)}: {frame_path}")
         org_h, org_w = _read_image_size(frame_path)
-        da3_intrinsics_org = scale_intrinsics_matrix_np(
-            da3_outputs["intrinsics"][frame_index],
-            src_h=int(da3_outputs["processed_h"]),
-            src_w=int(da3_outputs["processed_w"]),
-            dst_h=org_h,
-            dst_w=org_w,
+        da3_intrinsics_org = _resolve_da3_intrinsics_original(
+            da3_outputs,
+            frame_index,
+            org_h,
+            org_w,
         )
-        frame_fx_org, frame_fy_org, frame_cx_org, frame_cy_org, intrinsics_input_source = _resolve_frame_intrinsics(
-            args,
-            da3_intrinsics_org,
-        )
+        frame_w2c = da3_outputs["extrinsics_w2c"][frame_index]
+        frame_conf = None if da3_outputs["conf"] is None else da3_outputs["conf"][frame_index]
         frame_depth_path = None if depth_frame_paths is None else depth_frame_paths[frame_index]
+
+        override_gt_depth = None
+        override_gt_depth_mask = None
+        if da3_ransac_reference_enabled:
+            override_gt_depth, override_gt_depth_mask = _build_da3_ransac_override(
+                da3_outputs["depth"][frame_index],
+                frame_conf,
+            )
 
         result = run_depth_inference(
             frame_args,
@@ -397,21 +437,22 @@ def main(args: SequenceDepthInferenceArgs) -> None:
             device=device,
             input_image_path=frame_path,
             input_depth_path=frame_depth_path,
-            fx_org=frame_fx_org,
-            fy_org=frame_fy_org,
-            cx_org=frame_cx_org,
-            cy_org=frame_cy_org,
+            fx_org=float(da3_intrinsics_org[0, 0]),
+            fy_org=float(da3_intrinsics_org[1, 1]),
+            cx_org=float(da3_intrinsics_org[0, 2]),
+            cy_org=float(da3_intrinsics_org[1, 2]),
+            override_gt_depth=override_gt_depth,
+            override_gt_depth_mask=override_gt_depth_mask,
+        )
+        da3_intrinsics_output = _build_da3_output_intrinsics(
+            da3_intrinsics_org,
+            org_h=org_h,
+            org_w=org_w,
+            output_h=result.output_h,
+            output_w=result.output_w,
         )
 
-        frame_name = f"frame_{frame_index:06d}"
-        depth_raw_path = str(Path(output_paths.frame_depth_dir) / f"{frame_name}.npy")
-        depth_vis_path = str(Path(output_paths.frame_depth_vis_dir) / f"{frame_name}.png")
-        pcd_path = str(Path(output_paths.frame_pcd_dir) / f"{frame_name}.ply")
-        meta_path = str(Path(output_paths.frame_meta_dir) / f"{frame_name}.json")
-
-        frame_w2c = da3_outputs["extrinsics_w2c"][frame_index]
-        frame_conf = None if da3_outputs["conf"] is None else da3_outputs["conf"][frame_index]
-        if args.align_to_da3_depth:
+        if da3_post_scale_align_enabled:
             scale_align_depth_result(
                 result,
                 da3_outputs["depth"][frame_index],
@@ -424,6 +465,12 @@ def main(args: SequenceDepthInferenceArgs) -> None:
                 f"scale={result.depth_scale_align_factor:.6f}, valid_pixels={result.depth_scale_align_valid_pixels}"
             )
 
+        frame_name = f"frame_{frame_index:06d}"
+        depth_raw_path = str(Path(output_paths.frame_depth_dir) / f"{frame_name}.npy")
+        depth_vis_path = str(Path(output_paths.frame_depth_vis_dir) / f"{frame_name}.png")
+        pcd_path = str(Path(output_paths.frame_pcd_dir) / f"{frame_name}.ply")
+        meta_path = str(Path(output_paths.frame_meta_dir) / f"{frame_name}.json")
+
         frame_pcd = save_depth_inference_result(
             result,
             depth_vis_path=depth_vis_path,
@@ -431,6 +478,7 @@ def main(args: SequenceDepthInferenceArgs) -> None:
             pcd_path=pcd_path if args.save_frame_pcd else None,
             save_pcd=args.save_frame_pcd,
             pcd_extrinsics_w2c=frame_w2c,
+            pcd_intrinsics_override=da3_intrinsics_output,
         )
 
         if args.save_merged_pcd:
@@ -438,13 +486,16 @@ def main(args: SequenceDepthInferenceArgs) -> None:
                 frame_pcd = build_point_cloud_from_depth_result(
                     result,
                     pcd_extrinsics_w2c=frame_w2c,
+                    pcd_intrinsics_override=da3_intrinsics_output,
                 )
             merged_frame_pcds.append(frame_pcd)
 
         frame_c2w = np.linalg.inv(frame_w2c)
-        intrinsics_original_used = np.array(
-            [[frame_fx_org, 0.0, frame_cx_org], [0.0, frame_fy_org, frame_cy_org], [0.0, 0.0, 1.0]],
-            dtype=np.float32,
+        da3_post_scale_align_applied = (
+            da3_post_scale_align_enabled
+            and result.depth_scale_align_valid_pixels >= int(args.da3_scale_align_min_valid_pixels)
+            and np.isfinite(result.depth_scale_align_factor)
+            and result.depth_scale_align_factor > 0.0
         )
         frame_meta = {
             "frame_id": frame_index,
@@ -452,21 +503,26 @@ def main(args: SequenceDepthInferenceArgs) -> None:
             "source_path": frame_path,
             "source_type": source_type,
             "input_depth_path": frame_depth_path,
-            "depth_source_type": depth_source_type,
+            "depth_source_type": None if frame_depth_path is None else depth_source_type,
             "input_resolution": [result.org_h, result.org_w],
             "inference_resolution": [result.input_h, result.input_w],
             "output_resolution": [result.output_h, result.output_w],
             "da3_process_resolution": [int(da3_outputs["processed_h"]), int(da3_outputs["processed_w"])],
-            "intrinsics_input_source": intrinsics_input_source,
             "da3_intrinsics_original": da3_intrinsics_org.tolist(),
-            "intrinsics_original_used": intrinsics_original_used.tolist(),
-            "intrinsics_output": result.output_intrinsics_matrix().tolist(),
+            "da3_intrinsics_output": da3_intrinsics_output.tolist(),
+            "pcd_intrinsics_source": "da3",
+            "model_intrinsics_source": result.intrinsics_source,
+            "model_intrinsics_output": result.output_intrinsics_matrix().tolist(),
             "extrinsics_w2c": frame_w2c.tolist(),
             "extrinsics_c2w": frame_c2w.tolist(),
             "da3_conf_mean": None if frame_conf is None else float(np.mean(frame_conf)),
-            "da3_scale_align_enabled": args.align_to_da3_depth,
-            "da3_scale_align_factor": result.depth_scale_align_factor,
-            "da3_scale_align_valid_pixels": result.depth_scale_align_valid_pixels,
+            "da3_ransac_reference_enabled": da3_ransac_reference_enabled,
+            "da3_post_scale_align_enabled": da3_post_scale_align_enabled,
+            "da3_post_scale_align_applied": da3_post_scale_align_applied,
+            "da3_post_scale_align_factor": result.depth_scale_align_factor if da3_post_scale_align_enabled else 1.0,
+            "da3_post_scale_align_valid_pixels": result.depth_scale_align_valid_pixels if da3_post_scale_align_enabled else 0,
+            "da3_scale_align_factor": result.depth_scale_align_factor if da3_post_scale_align_enabled else 1.0,
+            "da3_scale_align_valid_pixels": result.depth_scale_align_valid_pixels if da3_post_scale_align_enabled else 0,
             "frame_pcd_path": pcd_path if args.save_frame_pcd else None,
             "depth_raw_path": depth_raw_path,
             "depth_vis_path": depth_vis_path,
@@ -491,13 +547,13 @@ def main(args: SequenceDepthInferenceArgs) -> None:
 
     manifest = {
         "input_path": str(input_path),
-        "input_depth_path": None if args.input_depth_path is None else str(Path(args.input_depth_path).expanduser().resolve()),
+        "input_depth_path": None if not use_input_depth or args.input_depth_path is None else str(Path(args.input_depth_path).expanduser().resolve()),
         "input_mode": input_mode,
         "source_type": source_type,
-        "depth_source_type": depth_source_type,
+        "depth_source_type": depth_source_type if use_input_depth else None,
         "num_frames": len(frame_paths),
         "video_fps": source_fps,
-        "depth_video_fps": depth_source_fps,
+        "depth_video_fps": depth_source_fps if use_input_depth else None,
         "output_root": output_paths.root_dir,
         "model_type": args.model_type,
         "da3_model": args.da3_model,
@@ -505,6 +561,8 @@ def main(args: SequenceDepthInferenceArgs) -> None:
         "da3_process_res_method": args.da3_process_res_method,
         "da3_ref_view_strategy": da3_outputs["ref_view_strategy"],
         "align_to_da3_depth": args.align_to_da3_depth,
+        "da3_depth_ransac_conditioning_enabled": da3_ransac_reference_enabled,
+        "da3_post_scale_align_enabled": da3_post_scale_align_enabled,
         "da3_scale_align_conf_threshold": args.da3_scale_align_conf_threshold,
         "da3_scale_align_min_valid_pixels": args.da3_scale_align_min_valid_pixels,
         "frame_depth_dir": output_paths.frame_depth_dir,

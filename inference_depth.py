@@ -124,6 +124,8 @@ def run_depth_inference(
     fy_org: Optional[float] = None,
     cx_org: Optional[float] = None,
     cy_org: Optional[float] = None,
+    override_gt_depth=None,
+    override_gt_depth_mask=None,
 ) -> DepthInferenceResult:
     if model is None or device is None:
         model, device = load_depth_model(args)
@@ -140,17 +142,57 @@ def run_depth_inference(
             "Please provide --input_depth_path."
         )
 
-    gt_depth, prompt_depth, gt_depth_mask, use_gt_depth, moge2_intrinsics = prepare_metric_depth_inputs(
-        input_depth_path=frame_depth_path,
-        input_size=args.input_size,
-        image=image,
-        device=device,
-        moge2_pretrained=args.moge2_pretrained,
-    )
-    if use_gt_depth and frame_depth_path is not None:
-        print(f"metric depth from `{frame_depth_path}`")
+    skip_metric_depth_inputs = args.model_type == "InfiniDepth" and override_gt_depth is not None
+    if skip_metric_depth_inputs:
+        gt_depth = None
+        prompt_depth = None
+        gt_depth_mask = None
+        moge2_intrinsics = None
     else:
-        print(f"metric depth from `{args.moge2_pretrained}`")
+        gt_depth, prompt_depth, gt_depth_mask, use_gt_depth, moge2_intrinsics = prepare_metric_depth_inputs(
+            input_depth_path=frame_depth_path,
+            input_size=args.input_size,
+            image=image,
+            device=device,
+            moge2_pretrained=args.moge2_pretrained,
+        )
+        if use_gt_depth and frame_depth_path is not None:
+            print(f"metric depth from `{frame_depth_path}`")
+        else:
+            print(f"metric depth from `{args.moge2_pretrained}`")
+
+    if override_gt_depth is not None:
+        gt_depth = _to_single_depth_tensor(
+            override_gt_depth,
+            device=device,
+            dtype=torch.float32,
+        )
+        if gt_depth.shape[-2:] != image.shape[-2:]:
+            gt_depth = F.interpolate(
+                gt_depth,
+                size=image.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        if override_gt_depth_mask is None:
+            gt_depth_mask = torch.isfinite(gt_depth) & (gt_depth > 1e-6)
+        else:
+            gt_depth_mask = _to_single_depth_tensor(
+                override_gt_depth_mask,
+                device=device,
+                dtype=torch.float32,
+            )
+            if gt_depth_mask.shape[-2:] != image.shape[-2:]:
+                gt_depth_mask = F.interpolate(
+                    gt_depth_mask,
+                    size=image.shape[-2:],
+                    mode="nearest",
+                )
+            gt_depth_mask = gt_depth_mask > 0.5
+            gt_depth_mask &= torch.isfinite(gt_depth) & (gt_depth > 1e-6)
+
+        print("metric depth from external override")
 
     frame_fx_org = args.fx_org if fx_org is None else fx_org
     frame_fy_org = args.fy_org if fy_org is None else fy_org
@@ -179,8 +221,8 @@ def run_depth_inference(
             f"Using image-size defaults in original space: fx={frame_fx_org:.2f}, fy={frame_fy_org:.2f}, cx={frame_cx_org:.2f}, cy={frame_cy_org:.2f}"
         )
 
-    gt = depth_to_disparity(gt_depth)
-    prompt = depth_to_disparity(prompt_depth)
+    gt = None if gt_depth is None else depth_to_disparity(gt_depth)
+    prompt = None if prompt_depth is None else depth_to_disparity(prompt_depth)
 
     _, _, h, w = image.shape
     fx, fy, cx, cy, _ = build_scaled_intrinsics_matrix(
@@ -219,7 +261,7 @@ def run_depth_inference(
         gt_depth=gt,
         gt_depth_mask=gt_depth_mask,
         prompt_depth=prompt,
-        prompt_mask=prompt > 0,
+        prompt_mask=None if prompt is None else prompt > 0,
     )
     pred_depthmap = pred_2d_uniform_depth.permute(0, 2, 1).view(1, 1, h_sample, w_sample)
 
@@ -334,15 +376,23 @@ def build_point_cloud_from_depth_result(
     result: DepthInferenceResult,
     *,
     pcd_extrinsics_w2c: Optional[np.ndarray] = None,
+    pcd_intrinsics_override: Optional[np.ndarray] = None,
     filter_flying_points: bool = True,
     nb_neighbors: int = 30,
     std_ratio: float = 2.0,
 ):
+    pcd_intrinsics = result.output_intrinsics_matrix()
+    if pcd_intrinsics_override is not None:
+        pcd_intrinsics = np.asarray(pcd_intrinsics_override, dtype=np.float32)
+        if pcd_intrinsics.shape != (3, 3):
+            raise ValueError(
+                f"pcd_intrinsics_override must have shape (3, 3), got {pcd_intrinsics.shape}"
+            )
     pcd = depth2pcd(
         result.query_2d_uniform_coord.squeeze().cpu(),
         result.pred_2d_uniform_depth.squeeze().cpu(),
         result.image.squeeze().cpu(),
-        result.output_intrinsics_matrix(),
+        pcd_intrinsics,
         ext=pcd_extrinsics_w2c,
     )
     if filter_flying_points and len(pcd.points) > 0:
@@ -359,6 +409,7 @@ def save_depth_inference_result(
     pcd_path: Optional[str] = None,
     save_pcd: bool = True,
     pcd_extrinsics_w2c: Optional[np.ndarray] = None,
+    pcd_intrinsics_override: Optional[np.ndarray] = None,
 ):
     plot_depth(result.org_img, result.pred_depthmap, depth_vis_path)
     if depth_raw_path is not None:
@@ -377,12 +428,14 @@ def save_depth_inference_result(
             result.cx,
             result.cy,
             pcd_path,
+            ixt=pcd_intrinsics_override,
             extrinsics_w2c=pcd_extrinsics_w2c,
         )
 
     return build_point_cloud_from_depth_result(
         result,
         pcd_extrinsics_w2c=pcd_extrinsics_w2c,
+        pcd_intrinsics_override=pcd_intrinsics_override,
     )
 
 

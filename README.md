@@ -316,7 +316,6 @@ python inference_multi_view_depth.py \
   --input_path=example_data/multi-view/waymo/image \
   --model_type=InfiniDepth \
   --depth_model_path=checkpoints/depth/infinidepth.ckpt \
-  --align_to_da3_depth=True
 ```
 
 **RGB + Depth Sensor Multi-View / Video Command**
@@ -327,7 +326,6 @@ python inference_multi_view_depth.py \
   --input_depth_path=example_data/multi-view/waymo/depth \
   --model_type=InfiniDepth_DepthSensor \
   --depth_model_path=checkpoints/depth/infinidepth_depthsensor.ckpt \
-  --align_to_da3_depth=True
 ```
 
 For video input, replace `--input_path` with a video file. When `--model_type=InfiniDepth_DepthSensor`, `--input_depth_path` can also be a depth video and must contain the same number of frames as the RGB input.
