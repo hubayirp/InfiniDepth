@@ -6,6 +6,9 @@
 </h1>
 
 <div align="center">
+  <a href="https://zju3dv.github.io/InfiniDepth/">
+    <img src="https://img.shields.io/badge/Project-Page-red?logo=googlechrome&logoColor=red">
+  </a>
   <a href="https://arxiv.org/abs/2601.03252">
     <img src="https://img.shields.io/badge/arXiv-Paper-blue?logo=arxiv&logoColor=blue">
   </a>
