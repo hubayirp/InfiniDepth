@@ -417,9 +417,10 @@ bash example_scripts/infer_depth/waymo_multi_view_infinidepth_explicit_camera.sh
 </details>
 
 ## 🏋️ Training and Validation
-First, prepare the training/validation data and the pretrained weight as described in [DATA.md](DATA.md).
 
 The repo also provides `main.py` training and validation entrypoints for InfiniDepth and InfiniDepth_DepthSensor.
+
+First, prepare the training/validation data and the pretrained weight as described in [DATA.md](DATA.md).
 
 Before running any command, export the environment variables required by `main.py`:
 

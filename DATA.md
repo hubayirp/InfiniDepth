@@ -5,8 +5,8 @@ The current training and validation configs expect the following datasets:
 | Dataset / Weight | Used in | Download / Placement |
 | --- | --- | --- |
 | Hypersim | training | [Download Link](https://huggingface.co/datasets/ritianyu/Hypersim) |
-| Real-World Benchmark (KITTI, ETH3D, NYU, ScanNet, DIODE) | validation | [Download Link](https://huggingface.co/datasets/ritianyu/Depth_Eval_Datasets) |
-| Synthetic Benchmark (CyberPunk, DeadIsland, Spiderman2, SpidermanMM, WatchDogLegion) | validation | [Download Link](https://huggingface.co/datasets/ritianyu/game_4k_data) |
+| Real-World Benchmark| validation | [Download Link](https://huggingface.co/datasets/ritianyu/Depth_Eval_Datasets) |
+| Synthetic Benchmark| validation | [Download Link](https://huggingface.co/datasets/ritianyu/game_4k_data) |
 | DINOv3 `vitl16` checkpoint | train infinidepth from scratch | place at `${commonspace}/pretrained_models/dinov3/dinov3_vitl16_pretrain_lvd1689m.pth` |
 
 After downloading and unpacking them, place them under `${commonspace}` like this:
